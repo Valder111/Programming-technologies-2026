@@ -13,7 +13,6 @@ import (
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
-	"github.com/openai/openai-go/responses"
 	"github.com/openai/openai-go/shared"
 )
 
@@ -26,7 +25,7 @@ location_code - код локации из текста, например LOC-03
 item_description - описание вещи или null.
 event_time - время потери, находки или другого события текстом как в сообщении, или null. Даты и время не пересчитывай.
 details - существенные сведения, которые не вошли в остальные поля, или null.
-Не выдумывай отсутствующие сведения. Для пустого поля пиши null, не пустую строку. Числа и списки не используй: только строка или null.`
+Не выдумывай отсутствующие сведения. Для пустого поля пиши JSON null без кавычек, не пустую строку и не текст null. Числа и списки не используй: только строка или null.`
 
 var categories = map[string]struct{}{
 	"lost":  {},
@@ -88,26 +87,55 @@ func OpenAIBase(raw string) string {
 	return raw
 }
 
+var extractionSchema = map[string]any{
+	"type":                 "object",
+	"additionalProperties": false,
+	"required":             []string{"category", "summary", "location_code", "item_description", "event_time", "details"},
+	"properties": map[string]any{
+		"category":         map[string]any{"type": "string", "enum": []string{"lost", "found", "claim", "other"}},
+		"summary":          map[string]any{"type": "string"},
+		"location_code":    map[string]any{"type": []string{"string", "null"}},
+		"item_description": map[string]any{"type": []string{"string", "null"}},
+		"event_time":       map[string]any{"type": []string{"string", "null"}},
+		"details":          map[string]any{"type": []string{"string", "null"}},
+	},
+}
+
 func (l *LLM) Extract(ctx context.Context, message string) (Extraction, error) {
 	ctx, cancel := context.WithTimeout(ctx, l.Timeout)
 	defer cancel()
 
-	resp, err := l.Client.Responses.New(ctx, responses.ResponseNewParams{
-		Model:        shared.ResponsesModel(l.Model),
-		Instructions: openai.String(systemPrompt),
-		Input: responses.ResponseNewParamsInputUnion{
-			OfString: openai.String(message),
+	// Chat Completions: LM Studio здесь принимает response_format и отдаёт content чистым JSON.
+	resp, err := l.Client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Model:           shared.ChatModel(l.Model),
+		Temperature:     openai.Float(l.Temp),
+		ReasoningEffort: shared.ReasoningEffort("none"),
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.SystemMessage(systemPrompt),
+			openai.UserMessage(message),
 		},
-		Temperature: openai.Float(l.Temp),
-		Reasoning: shared.ReasoningParam{
-			Effort: shared.ReasoningEffort("none"),
+		ResponseFormat: openai.ChatCompletionNewParamsResponseFormatUnion{
+			OfJSONSchema: &shared.ResponseFormatJSONSchemaParam{
+				JSONSchema: shared.ResponseFormatJSONSchemaJSONSchemaParam{
+					Name:   "lost_found",
+					Strict: openai.Bool(true),
+					Schema: extractionSchema,
+				},
+			},
 		},
 	})
 	if err != nil {
 		return Extraction{}, modelCallError(err)
 	}
+	if len(resp.Choices) == 0 {
+		return Extraction{}, &StatusError{
+			Status:  502,
+			Code:    "invalid_model_response",
+			Message: "Ответ модели не является допустимым JSON по схеме",
+		}
+	}
 
-	text := strings.TrimSpace(resp.OutputText())
+	text := strings.TrimSpace(resp.Choices[0].Message.Content)
 	ex, err := ParseExtraction(text)
 	if err != nil {
 		log.Printf("ответ модели не прошёл схему: %v; текст: %s", err, clip(text, 500))
@@ -141,34 +169,7 @@ func modelCallError(err error) error {
 }
 
 func ParseExtraction(raw string) (Extraction, error) {
-	raw = unwrapFence(raw)
-	ex, err := decodeExtraction(raw)
-	if err == nil {
-		return ex, nil
-	}
-	start := strings.Index(raw, "{")
-	end := strings.LastIndex(raw, "}")
-	if start >= 0 && end > start {
-		if ex2, err2 := decodeExtraction(raw[start : end+1]); err2 == nil {
-			return ex2, nil
-		}
-	}
-	return Extraction{}, err
-}
-
-func unwrapFence(s string) string {
-	s = strings.TrimSpace(strings.TrimPrefix(s, "\uFEFF"))
-	if !strings.HasPrefix(s, "```") {
-		return s
-	}
-	s = strings.TrimSpace(strings.TrimPrefix(s, "```"))
-	if len(s) >= 4 && strings.EqualFold(s[:4], "json") {
-		s = strings.TrimSpace(s[4:])
-	}
-	if i := strings.LastIndex(s, "```"); i >= 0 {
-		s = s[:i]
-	}
-	return strings.TrimSpace(s)
+	return decodeExtraction(strings.TrimSpace(strings.TrimPrefix(raw, "\uFEFF")))
 }
 
 func decodeExtraction(raw string) (Extraction, error) {
@@ -219,7 +220,7 @@ func clean(value *string) *string {
 		return nil
 	}
 	trimmed := strings.TrimSpace(*value)
-	if trimmed == "" {
+	if trimmed == "" || strings.EqualFold(trimmed, "null") {
 		return nil
 	}
 	return &trimmed
